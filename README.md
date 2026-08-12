@@ -58,24 +58,21 @@ The stable installation URL is:
 https://github.com/kaicate/quick-preview/releases/latest/download/QuickPreview.appinstaller
 ```
 
-Create a `release` environment from the repository's GitHub Settings page:
-
-1. Open **Settings > Environments > New environment**.
-2. Enter `release` as the environment name.
-3. Add the following environment variable and secrets.
+Create a `release` environment in the GitHub repository with this configuration:
 
 - Variable `WINDOWS_PUBLISHER`: the exact Subject of the code-signing
   certificate, such as `CN=Your Publisher`
 - Secret `WINDOWS_CERTIFICATE_BASE64`: the PFX file encoded as base64
 - Secret `WINDOWS_CERTIFICATE_PASSWORD`: the PFX password
 
-Generate the base64 value locally in PowerShell and paste the output directly
-into the `WINDOWS_CERTIFICATE_BASE64` secret field:
+With GitHub CLI installed and authenticated, the repository setup can be done
+from PowerShell without writing an encoded certificate to disk:
 
 ```powershell
-[Convert]::ToBase64String(
-  [IO.File]::ReadAllBytes("$env:USERPROFILE\Documents\QuickPreview-signing\QuickPreview-dev.pfx")
-) | Set-Clipboard
+./packaging/configure-github-release.ps1 `
+  -CertificatePath cert.pfx `
+  -CertificatePassword (Read-Host 'PFX password' -AsSecureString) `
+  -Repository kaicate/quick-preview
 ```
 
 Do not commit the PFX, certificate password, generated MSIX, or generated App
@@ -87,11 +84,6 @@ by the target Windows devices. Once the environment is configured and the
 git tag v0.1.0
 git push origin v0.1.0
 ```
-
-The repository remote uses SSH (`git@github.com:kaicate/quick-preview.git`) for
-code and tag pushes. GitHub does not expose environment or secret management
-over its SSH Git endpoint, so those values must be entered through GitHub
-Settings (or its HTTPS API). Never transfer the PFX through the Git repository.
 
 ## Keyboard shortcuts
 
