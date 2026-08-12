@@ -66,27 +66,43 @@ $Manifest = $ManifestTemplate.Replace("@@PUBLISHER@@", (ConvertTo-XmlAttribute $
 Set-Content (Join-Path $Stage "AppxManifest.xml") $Manifest -Encoding UTF8
 
 Add-Type -AssemblyName System.Drawing
-function New-Logo([string]$Path, [int]$Width, [int]$Height) {
-    $Bitmap = New-Object System.Drawing.Bitmap($Width, $Height)
+function New-AppAsset([string]$Path, [int]$Width, [int]$Height, [switch]$FitSquare) {
+    $SourcePath = Join-Path $ProjectRoot "assets\QuickPreview.png"
+    if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+        throw "App icon source was not found: $SourcePath"
+    }
+
+    $Source = [System.Drawing.Image]::FromFile($SourcePath)
+    $Bitmap = New-Object System.Drawing.Bitmap($Width, $Height, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
     $Graphics = [System.Drawing.Graphics]::FromImage($Bitmap)
     try {
-        $Graphics.Clear([System.Drawing.Color]::FromArgb(32, 105, 180))
-        $FontSize = [Math]::Max(10, [Math]::Min($Width, $Height) * 0.42)
-        $Font = New-Object System.Drawing.Font("Segoe UI", $FontSize, [System.Drawing.FontStyle]::Bold)
-        try {
-            $Format = New-Object System.Drawing.StringFormat
-            $Format.Alignment = [System.Drawing.StringAlignment]::Center
-            $Format.LineAlignment = [System.Drawing.StringAlignment]::Center
-            $Graphics.DrawString("Q", $Font, [System.Drawing.Brushes]::White, (New-Object System.Drawing.RectangleF(0, 0, $Width, $Height)), $Format)
-        } finally { $Font.Dispose() }
+        $Graphics.Clear([System.Drawing.Color]::Transparent)
+        $Graphics.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+        $Graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $Graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+        $Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+
+        if ($FitSquare) {
+            $Size = [Math]::Min($Width, $Height)
+            $X = [Math]::Floor(($Width - $Size) / 2)
+            $Y = [Math]::Floor(($Height - $Size) / 2)
+            $Destination = New-Object System.Drawing.Rectangle($X, $Y, $Size, $Size)
+        } else {
+            $Destination = New-Object System.Drawing.Rectangle(0, 0, $Width, $Height)
+        }
+        $Graphics.DrawImage($Source, $Destination)
         $Bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
-    } finally { $Graphics.Dispose(); $Bitmap.Dispose() }
+    } finally {
+        $Graphics.Dispose()
+        $Bitmap.Dispose()
+        $Source.Dispose()
+    }
 }
 
-New-Logo (Join-Path $Stage "Assets\StoreLogo.png") 50 50
-New-Logo (Join-Path $Stage "Assets\Square44x44Logo.png") 44 44
-New-Logo (Join-Path $Stage "Assets\Square150x150Logo.png") 150 150
-New-Logo (Join-Path $Stage "Assets\Wide310x150Logo.png") 310 150
+New-AppAsset (Join-Path $Stage "Assets\StoreLogo.png") 50 50
+New-AppAsset (Join-Path $Stage "Assets\Square44x44Logo.png") 44 44
+New-AppAsset (Join-Path $Stage "Assets\Square150x150Logo.png") 150 150
+New-AppAsset (Join-Path $Stage "Assets\Wide310x150Logo.png") 310 150 -FitSquare
 
 $MakeAppx = Resolve-WindowsSdkTool "makeappx.exe"
 $MsixPath = Join-Path $Output "QuickPreview-$Version-x64.msix"
