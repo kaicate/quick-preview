@@ -9,7 +9,7 @@ use crate::Result;
 pub struct AtomicWriter {
     destination: PathBuf,
     temporary: PathBuf,
-    writer: BufWriter<File>,
+    writer: Option<BufWriter<File>>,
     committed: bool,
 }
 
@@ -31,7 +31,7 @@ impl AtomicWriter {
                     return Ok(Self {
                         destination: destination.to_owned(),
                         temporary,
-                        writer: BufWriter::with_capacity(1024 * 1024, file),
+                        writer: Some(BufWriter::with_capacity(1024 * 1024, file)),
                         committed: false,
                     })
                 }
@@ -47,8 +47,14 @@ impl AtomicWriter {
     }
 
     pub fn commit(mut self) -> Result<()> {
-        self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
+        let mut writer = self
+            .writer
+            .take()
+            .expect("writer is available before commit");
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        // Windows cannot replace a file while the source handle is still open.
+        drop(writer);
         replace_file(&self.temporary, &self.destination)?;
         self.committed = true;
         Ok(())
@@ -57,10 +63,16 @@ impl AtomicWriter {
 
 impl Write for AtomicWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.writer.write(buf)
+        self.writer
+            .as_mut()
+            .expect("writer is available before commit")
+            .write(buf)
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        self.writer.flush()
+        self.writer
+            .as_mut()
+            .expect("writer is available before commit")
+            .flush()
     }
 }
 

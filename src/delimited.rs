@@ -158,8 +158,19 @@ impl DelimitedDocument {
             }
             writer.write_all(self.rows[row].newline.bytes())?;
         }
-        writer.commit()?;
-        self.edits.clear();
+        // The mapped destination must be released before ReplaceFileW can
+        // atomically replace it on Windows. All source bytes have already
+        // been copied to the temporary file at this point.
+        self.map = MappedFile(None);
+        if let Err(error) = writer.commit() {
+            if let Ok(file) = File::open(path) {
+                if let Ok(map) = MappedFile::open(&file) {
+                    self.map = map;
+                }
+            }
+            return Err(error);
+        }
+
         let file = File::open(path)?;
         self.map = MappedFile::open(&file)?;
         let start = if self.encoding.bom && self.map.starts_with(&[0xEF, 0xBB, 0xBF]) {
@@ -168,6 +179,7 @@ impl DelimitedDocument {
             0
         };
         self.rows = index_records(&self.map, start)?;
+        self.edits.clear();
         Ok(())
     }
 
