@@ -99,7 +99,7 @@ jobs:
             [IO.File]::WriteAllBytes($publicCertificatePath, $publicBytes)
             $trustedCertificate = Import-Certificate `
               -FilePath $publicCertificatePath `
-              -CertStoreLocation Cert:\CurrentUser\TrustedPeople
+              -CertStoreLocation Cert:\LocalMachine\TrustedPeople
 
             "thumbprint=$($certificate.Thumbprint)" >> $env:GITHUB_OUTPUT
             "trusted_thumbprint=$($trustedCertificate.Thumbprint)" >> $env:GITHUB_OUTPUT
@@ -168,7 +168,7 @@ jobs:
         run: |
           $trustedThumbprint = "${{ steps.certificate.outputs.trusted_thumbprint }}"
           if ($trustedThumbprint) {
-            Remove-Item "Cert:\CurrentUser\TrustedPeople\$trustedThumbprint" `
+            Remove-Item "Cert:\LocalMachine\TrustedPeople\$trustedThumbprint" `
               -Force -ErrorAction SilentlyContinue
           }
           $paths = @(
