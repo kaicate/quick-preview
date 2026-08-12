@@ -24,7 +24,7 @@ jobs:
 
     steps:
       - name: Check out the tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Validate release configuration
         shell: pwsh
@@ -70,6 +70,7 @@ jobs:
         shell: pwsh
         run: |
           $certificatePath = Join-Path $env:RUNNER_TEMP "quick-preview-signing.pfx"
+          $publicCertificatePath = Join-Path $env:RUNNER_TEMP "quick-preview-signing.cer"
           try {
             $certificateBytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64)
           } catch {
@@ -77,6 +78,34 @@ jobs:
           }
           [IO.File]::WriteAllBytes($certificatePath, $certificateBytes)
           "path=$certificatePath" >> $env:GITHUB_OUTPUT
+          "public_path=$publicCertificatePath" >> $env:GITHUB_OUTPUT
+
+          $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
+            $certificatePath,
+            $env:WINDOWS_CERTIFICATE_PASSWORD,
+            [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+          )
+          try {
+            if (-not $certificate.HasPrivateKey) {
+              throw "The signing PFX does not contain a private key."
+            }
+            if ($certificate.Subject -ne $env:WINDOWS_PUBLISHER) {
+              throw "WINDOWS_PUBLISHER does not match the signing certificate subject."
+            }
+
+            $publicBytes = $certificate.Export(
+              [Security.Cryptography.X509Certificates.X509ContentType]::Cert
+            )
+            [IO.File]::WriteAllBytes($publicCertificatePath, $publicBytes)
+            $trustedCertificate = Import-Certificate `
+              -FilePath $publicCertificatePath `
+              -CertStoreLocation Cert:\CurrentUser\TrustedPeople
+
+            "thumbprint=$($certificate.Thumbprint)" >> $env:GITHUB_OUTPUT
+            "trusted_thumbprint=$($trustedCertificate.Thumbprint)" >> $env:GITHUB_OUTPUT
+          } finally {
+            $certificate.Dispose()
+          }
 
       - name: Build and sign package
         shell: pwsh
@@ -97,6 +126,9 @@ jobs:
           $signature = Get-AuthenticodeSignature $msixPath
           if ($signature.Status -ne "Valid") {
             throw "MSIX signature is not valid: $($signature.Status) $($signature.StatusMessage)"
+          }
+          if ($signature.SignerCertificate.Thumbprint -ne "${{ steps.certificate.outputs.thumbprint }}") {
+            throw "MSIX was not signed by the configured certificate."
           }
 
           [xml]$installer = Get-Content "target/package/QuickPreview.appinstaller" -Raw
@@ -131,6 +163,18 @@ jobs:
             --title "QuickPreview ${{ github.ref_name }}"
 
       - name: Remove signing certificate
-        if: always() && steps.certificate.outputs.path != ''
+        if: always()
         shell: pwsh
-        run: Remove-Item -LiteralPath "${{ steps.certificate.outputs.path }}" -Force -ErrorAction SilentlyContinue
+        run: |
+          $trustedThumbprint = "${{ steps.certificate.outputs.trusted_thumbprint }}"
+          if ($trustedThumbprint) {
+            Remove-Item "Cert:\CurrentUser\TrustedPeople\$trustedThumbprint" `
+              -Force -ErrorAction SilentlyContinue
+          }
+          $paths = @(
+            "${{ steps.certificate.outputs.path }}"
+            "${{ steps.certificate.outputs.public_path }}"
+          ) | Where-Object { $_ }
+          $paths | ForEach-Object {
+            Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue
+          }

@@ -1,6 +1,6 @@
 [package]
 name = "quick-preview"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 description = "A lightweight Windows preview and editor for CSV, TSV, Markdown, and HTML"
