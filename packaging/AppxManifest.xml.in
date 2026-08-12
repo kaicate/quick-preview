@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  xmlns:win32dependencies="http://schemas.microsoft.com/appx/manifest/externaldependencies"
+  IgnorableNamespaces="uap rescap win32dependencies">
+  <Identity Name="QuickPreview" Publisher="@@PUBLISHER@@" Version="@@VERSION@@" ProcessorArchitecture="x64" />
+  <Properties>
+    <DisplayName>QuickPreview</DisplayName>
+    <PublisherDisplayName>QuickPreview</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0" MaxVersionTested="10.0.26100.0" />
+    <win32dependencies:ExternalDependency
+      Name="Microsoft.WebView2"
+      Publisher="CN=Microsoft Windows, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
+      MinVersion="1.0.0.0"
+      Optional="false" />
+  </Dependencies>
+  <Resources><Resource Language="ja-jp" /><Resource Language="en-us" /></Resources>
+  <Applications>
+    <Application Id="QuickPreview" Executable="QuickPreview.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements DisplayName="QuickPreview" Description="Lightweight CSV, TSV, Markdown and HTML preview editor"
+        BackgroundColor="transparent" Square44x44Logo="Assets\Square44x44Logo.png" Square150x150Logo="Assets\Square150x150Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
+      </uap:VisualElements>
+      <Extensions>
+        <uap:Extension Category="windows.fileTypeAssociation">
+          <uap:FileTypeAssociation Name="quickpreview.documents">
+            <uap:DisplayName>QuickPreview document</uap:DisplayName>
+            <uap:SupportedFileTypes>
+              <uap:FileType>.csv</uap:FileType><uap:FileType>.tsv</uap:FileType>
+              <uap:FileType>.md</uap:FileType><uap:FileType>.markdown</uap:FileType>
+              <uap:FileType>.html</uap:FileType><uap:FileType>.htm</uap:FileType>
+            </uap:SupportedFileTypes>
+          </uap:FileTypeAssociation>
+        </uap:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+  <Capabilities><rescap:Capability Name="runFullTrust" /></Capabilities>
+</Package>
+

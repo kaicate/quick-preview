@@ -1,0 +1,8 @@
+/target/
+docs/
+/.vs/
+*.pfx
+*.cer
+*.msix
+*.msixbundle
+

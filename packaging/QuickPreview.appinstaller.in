@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AppInstaller xmlns="http://schemas.microsoft.com/appx/appinstaller/2018"
+  Version="@@VERSION@@" Uri="@@APPINSTALLER_URI@@">
+  <MainPackage Name="QuickPreview" Publisher="@@PUBLISHER@@" Version="@@VERSION@@"
+    ProcessorArchitecture="x64" Uri="@@MSIX_URI@@" />
+  <UpdateSettings>
+    <OnLaunch HoursBetweenUpdateChecks="24" ShowPrompt="true" UpdateBlocksActivation="false" />
+  </UpdateSettings>
+</AppInstaller>
+
