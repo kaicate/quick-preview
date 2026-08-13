@@ -27,10 +27,8 @@ cargo test
 cargo build --release
 ```
 
-The application artwork is stored in `assets/QuickPreview.png`. The Windows
-executable embeds `assets/QuickPreview.ico`, while the MSIX packaging script
-creates the Store, app-list, and tile images from the PNG source so releases
-use the same icon everywhere.
+The application artwork is stored in `assets/QuickPreview.png`, and the Windows
+executable embeds `assets/QuickPreview.ico`.
 
 ## Keyboard shortcuts
 
