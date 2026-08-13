@@ -27,20 +27,6 @@ cargo test
 cargo build --release
 ```
 
-The MSIX packaging script expects `makeappx.exe` and `signtool.exe` from the
-Windows SDK:
-
-```powershell
-./packaging/build-msix.ps1 `
-  -Publisher 'CN=Your Publisher' `
-  -CertificatePath cert.pfx `
-  -AppInstallerUri 'https://github.com/kaicate/quick-preview/releases/latest/download/QuickPreview.appinstaller' `
-  -MsixUri 'https://github.com/kaicate/quick-preview/releases/download/v0.1.0/QuickPreview-0.1.0.0-x64.msix'
-```
-
-The package never contains a signing private key. For development, pass
-`-SkipSign` and sign the resulting package separately before installation.
-
 The application artwork is stored in `assets/QuickPreview.png`. The Windows
 executable embeds `assets/QuickPreview.ico`, while the MSIX packaging script
 creates the Store, app-list, and tile images from the PNG source so releases
