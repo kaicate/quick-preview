@@ -167,9 +167,9 @@ pub(crate) fn preview_shell(
         r#"<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
 <title>{title}</title><style>
-:root{{color-scheme:light dark;font:15px/1.55 system-ui,sans-serif}}body{{max-width:980px;margin:0 auto;padding:24px}}img{{max-width:100%}}
+:root{{color-scheme:light dark;font:15px/1.55 system-ui,sans-serif}}body{{max-width:980px;margin:0 auto;padding:24px;background:Canvas;color:CanvasText}}img{{max-width:100%}}
 .qp-block{{border:1px solid transparent;border-radius:5px;padding:2px 7px;margin:1px -8px}}.qp-block:hover{{border-color:#6aa9ff}}
-textarea.qp-editor{{box-sizing:border-box;width:100%;min-height:7em;resize:vertical;font:14px/1.45 Consolas,monospace}}
+textarea.qp-editor{{box-sizing:border-box;width:100%;min-height:7em;resize:vertical;font:14px/1.45 Consolas,monospace;background:Canvas;color:CanvasText;border:1px solid #888}}
 table{{border-collapse:collapse}}th,td{{border:1px solid #888;padding:.3em .6em}}pre{{overflow:auto;padding:12px;background:#8882}}
 .math{{font-family:'Cambria Math',serif}}a{{color:#2785d8}}</style></head><body data-mode="{mode}">{body}<script>
 (()=>{{'use strict';const revision={revision};const sources=new Map({sources_json});

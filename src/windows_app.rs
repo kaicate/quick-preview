@@ -1,4 +1,13 @@
-use std::{ffi::c_void, mem::size_of, path::PathBuf, thread};
+use std::{
+    ffi::c_void,
+    mem::size_of,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+};
 
 use quick_preview::{
     document::FormatDocument, encoding::TextEncoding, history::EditCommand,
@@ -8,13 +17,14 @@ use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 use windows::{
     core::{w, Error, Result, PCWSTR, PWSTR},
     Win32::{
-        Foundation::{E_POINTER, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{ERROR_SUCCESS, E_POINTER, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::{
             Direct2D::{
                 Common::{D2D1_COLOR_F, D2D_RECT_F, D2D_SIZE_U},
                 *,
             },
             DirectWrite::*,
+            Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE},
             Gdi::{
                 BeginPaint, EndPaint, GetSysColorBrush, InvalidateRect, UpdateWindow, COLOR_WINDOW,
                 PAINTSTRUCT,
@@ -23,11 +33,12 @@ use windows::{
         System::{
             Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED},
             LibraryLoader::GetModuleHandleW,
+            Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD},
         },
         UI::{
             Controls::{
                 Dialogs::{GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST, OPENFILENAMEW},
-                EM_SETSEL,
+                SetWindowTheme, EM_SETSEL,
             },
             HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2},
             Input::KeyboardAndMouse::{
@@ -81,6 +92,7 @@ pub fn run() -> Result<()> {
             None,
         )?;
         let state = Box::new(AppState::new(hwnd)?);
+        apply_title_bar_theme(hwnd, state.dark_mode);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
         DragAcceptFiles(hwnd, true);
         let _ = ShowWindow(hwnd, SW_SHOW);
@@ -116,10 +128,12 @@ struct AppState {
     first_column: usize,
     editor: Option<HWND>,
     loading: bool,
+    dark_mode: bool,
 }
 
 impl AppState {
     fn new(hwnd: HWND) -> Result<Self> {
+        let dark_mode = system_uses_dark_mode();
         Ok(Self {
             hwnd,
             document: None,
@@ -131,7 +145,24 @@ impl AppState {
             first_column: 0,
             editor: None,
             loading: false,
+            dark_mode,
         })
+    }
+
+    fn update_theme(&mut self) {
+        let dark_mode = system_uses_dark_mode();
+        if self.dark_mode == dark_mode {
+            return;
+        }
+        self.dark_mode = dark_mode;
+        apply_title_bar_theme(self.hwnd, dark_mode);
+        if let Some(editor) = self.editor {
+            apply_control_theme(editor, dark_mode);
+        }
+        self.refresh_view();
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
     }
 
     fn set_document(&mut self, result: quick_preview::Result<DocumentSession>) {
@@ -275,6 +306,7 @@ impl AppState {
                 None,
             ) {
                 let _ = SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+                apply_control_theme(edit, self.dark_mode);
                 let _ = SetWindowSubclass(edit, Some(edit_subclass_proc), 1, 0);
                 let _ = SetFocus(Some(edit));
                 self.editor = Some(edit);
@@ -482,7 +514,10 @@ struct GridRenderer {
     _factory: ID2D1Factory,
     target: ID2D1HwndRenderTarget,
     text_format: IDWriteTextFormat,
+    start_title_format: IDWriteTextFormat,
+    start_text_format: IDWriteTextFormat,
     text: ID2D1SolidColorBrush,
+    muted_text: ID2D1SolidColorBrush,
     line: ID2D1SolidColorBrush,
     header: ID2D1SolidColorBrush,
     selection: ID2D1SolidColorBrush,
@@ -510,15 +545,38 @@ impl GridRenderer {
                 14.0,
                 w!("ja-JP"),
             )?;
+            let start_title_format = write_factory.CreateTextFormat(
+                w!("Segoe UI"),
+                None,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                30.0,
+                w!("en-US"),
+            )?;
+            let start_text_format = write_factory.CreateTextFormat(
+                w!("Segoe UI"),
+                None,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                16.0,
+                w!("en-US"),
+            )?;
+            start_title_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            start_text_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             let brush = |color: D2D1_COLOR_F| target.CreateSolidColorBrush(&color, None);
             Ok(Self {
                 text: brush(color(0.10, 0.10, 0.10, 1.0))?,
+                muted_text: brush(color(0.38, 0.40, 0.43, 1.0))?,
                 line: brush(color(0.78, 0.78, 0.78, 1.0))?,
                 header: brush(color(0.93, 0.94, 0.95, 1.0))?,
                 selection: brush(color(0.78, 0.88, 1.0, 1.0))?,
                 _factory: factory,
                 target,
                 text_format,
+                start_title_format,
+                start_text_format,
             })
         }
     }
@@ -531,8 +589,32 @@ impl GridRenderer {
 
     fn draw(&self, state: &AppState) {
         unsafe {
+            let (background, text, muted, line, header, selection) = if state.dark_mode {
+                (
+                    color(0.075, 0.082, 0.094, 1.0),
+                    color(0.91, 0.92, 0.94, 1.0),
+                    color(0.62, 0.65, 0.70, 1.0),
+                    color(0.25, 0.27, 0.31, 1.0),
+                    color(0.13, 0.14, 0.17, 1.0),
+                    color(0.12, 0.28, 0.48, 1.0),
+                )
+            } else {
+                (
+                    color(1.0, 1.0, 1.0, 1.0),
+                    color(0.10, 0.10, 0.10, 1.0),
+                    color(0.38, 0.40, 0.43, 1.0),
+                    color(0.78, 0.78, 0.78, 1.0),
+                    color(0.93, 0.94, 0.95, 1.0),
+                    color(0.78, 0.88, 1.0, 1.0),
+                )
+            };
+            self.text.SetColor(&text);
+            self.muted_text.SetColor(&muted);
+            self.line.SetColor(&line);
+            self.header.SetColor(&header);
+            self.selection.SetColor(&selection);
             self.target.BeginDraw();
-            self.target.Clear(Some(&color(1.0, 1.0, 1.0, 1.0)));
+            self.target.Clear(Some(&background));
             if let Some(DocumentSession {
                 document: FormatDocument::Delimited(grid),
                 ..
@@ -667,8 +749,64 @@ impl GridRenderer {
                         None,
                     );
                 }
+            } else {
+                self.draw_start_screen(state.hwnd);
             }
             let _ = self.target.EndDraw(None, None);
+        }
+    }
+
+    fn draw_start_screen(&self, hwnd: HWND) {
+        let size = client_size(hwnd);
+        let width = size.width as f32;
+        let height = size.height as f32;
+        let top = (height * 0.5 - 150.0).max(48.0);
+        draw_text(
+            &self.target,
+            &self.start_title_format,
+            &self.text,
+            "QuickPreview",
+            D2D_RECT_F {
+                left: 24.0,
+                top,
+                right: width - 24.0,
+                bottom: top + 48.0,
+            },
+        );
+        draw_text(
+            &self.target,
+            &self.start_text_format,
+            &self.muted_text,
+            "ファイルを開いてプレビュー・編集",
+            D2D_RECT_F {
+                left: 24.0,
+                top: top + 52.0,
+                right: width - 24.0,
+                bottom: top + 82.0,
+            },
+        );
+        for (index, shortcut) in [
+            "Ctrl + O: Open",
+            "Drag & Drop: Open",
+            "Ctrl + S: Save",
+            "Ctrl + Z / Ctrl + Y: Undo / Redo",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let y = top + 112.0 + index as f32 * 34.0;
+            draw_text(
+                &self.target,
+                &self.start_text_format,
+                &self.text,
+                shortcut,
+                D2D_RECT_F {
+                    left: 24.0,
+                    top: y,
+                    right: width - 24.0,
+                    bottom: y + 28.0,
+                },
+            );
         }
     }
 }
@@ -676,6 +814,7 @@ impl GridRenderer {
 struct WebPreview {
     controller: ICoreWebView2Controller,
     webview: ICoreWebView2,
+    allow_preview_navigation: Arc<AtomicBool>,
 }
 
 impl WebPreview {
@@ -734,6 +873,7 @@ impl WebPreview {
                 .CoreWebView2()
                 .map_err(webview2_com::Error::WindowsError)?
         };
+        let allow_preview_navigation = Arc::new(AtomicBool::new(false));
         unsafe {
             controller
                 .SetBounds(client_rect(parent))
@@ -756,10 +896,11 @@ impl WebPreview {
             settings
                 .SetIsStatusBarEnabled(false)
                 .map_err(webview2_com::Error::WindowsError)?;
+            let navigation_permission = Arc::clone(&allow_preview_navigation);
             let mut navigation_token = 0;
             webview
                 .add_NavigationStarting(
-                    &NavigationStartingEventHandler::create(Box::new(|_sender, args| {
+                    &NavigationStartingEventHandler::create(Box::new(move |_sender, args| {
                         if let Some(args) = args {
                             let mut raw = PWSTR::null();
                             args.Uri(&mut raw)?;
@@ -771,7 +912,14 @@ impl WebPreview {
                             if !raw.is_null() {
                                 CoTaskMemFree(Some(raw.0 as *const c_void));
                             }
-                            if uri != "about:blank" {
+                            let internal_preview = if uri.eq_ignore_ascii_case("about:blank") {
+                                navigation_permission.store(false, Ordering::SeqCst);
+                                true
+                            } else {
+                                is_preview_data_uri(&uri)
+                                    && navigation_permission.swap(false, Ordering::SeqCst)
+                            };
+                            if !internal_preview {
                                 args.SetCancel(true)?;
                             }
                         }
@@ -824,11 +972,17 @@ impl WebPreview {
         Ok(Self {
             controller,
             webview,
+            allow_preview_navigation,
         })
     }
     fn navigate_to_string(&self, html: &str) -> Result<()> {
         let wide = CoTaskMemPWSTR::from(html);
-        unsafe { self.webview.NavigateToString(*wide.as_ref().as_pcwstr()) }
+        self.allow_preview_navigation.store(true, Ordering::SeqCst);
+        let result = unsafe { self.webview.NavigateToString(*wide.as_ref().as_pcwstr()) };
+        if result.is_err() {
+            self.allow_preview_navigation.store(false, Ordering::SeqCst);
+        }
+        result
     }
     fn resize(&self, hwnd: HWND) {
         unsafe {
@@ -878,6 +1032,11 @@ extern "system" fn window_proc(
                 }
                 LRESULT(0)
             }
+            WM_SETTINGCHANGE => {
+                state.update_theme();
+                LRESULT(0)
+            }
+            WM_ERASEBKGND => LRESULT(1),
             WM_PAINT => {
                 let mut paint = PAINTSTRUCT::default();
                 BeginPaint(hwnd, &mut paint);
@@ -1104,6 +1263,42 @@ fn client_size(hwnd: HWND) -> D2D_SIZE_U {
 fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }
+fn system_uses_dark_mode() -> bool {
+    let mut apps_use_light_theme = 1u32;
+    let mut size = size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut apps_use_light_theme as *mut u32).cast()),
+            Some(&mut size),
+        )
+    };
+    status == ERROR_SUCCESS && apps_use_light_theme == 0
+}
+fn apply_title_bar_theme(hwnd: HWND, dark_mode: bool) {
+    let enabled = i32::from(dark_mode);
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&enabled as *const i32).cast(),
+            size_of::<i32>() as u32,
+        );
+    }
+}
+fn apply_control_theme(hwnd: HWND, dark_mode: bool) {
+    unsafe {
+        let _ = if dark_mode {
+            SetWindowTheme(hwnd, w!("DarkMode_Explorer"), PCWSTR::null())
+        } else {
+            SetWindowTheme(hwnd, PCWSTR::null(), PCWSTR::null())
+        };
+    }
+}
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
@@ -1124,6 +1319,30 @@ fn show_error(hwnd: HWND, message: &str) {
             w!("QuickPreview"),
             MB_OK | MB_ICONERROR,
         );
+    }
+}
+// NavigateToString is surfaced by current WebView2 runtimes as a data URL, even
+// though the committed document has the trusted about:blank origin.
+fn is_preview_data_uri(uri: &str) -> bool {
+    uri.get(..14)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:text/html"))
+        && matches!(uri.as_bytes().get(14), Some(b',' | b';'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_preview_data_uri;
+
+    #[test]
+    fn recognizes_only_html_data_urls() {
+        assert!(is_preview_data_uri("data:text/html,<h1>preview</h1>"));
+        assert!(is_preview_data_uri(
+            "data:text/html;charset=utf-8;base64,PGgxPnByZXZpZXc8L2gxPg=="
+        ));
+        assert!(is_preview_data_uri("DATA:TEXT/HTML,preview"));
+        assert!(!is_preview_data_uri("about:blank"));
+        assert!(!is_preview_data_uri("data:text/plain,preview"));
+        assert!(!is_preview_data_uri("https://example.com"));
     }
 }
 fn column_name(mut column: usize) -> String {
