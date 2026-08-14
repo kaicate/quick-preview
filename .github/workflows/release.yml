@@ -1,0 +1,86 @@
+name: Windows release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Build and publish Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out the tagged revision
+        uses: actions/checkout@v5
+
+      - name: Validate tag and package versions
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_name }}" -notmatch '^v(?<version>\d+\.\d+\.\d+)$') {
+            throw "Release tags must use vMAJOR.MINOR.PATCH (for example, v0.1.4)."
+          }
+
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $packageVersion = ($metadata.packages | Where-Object name -eq "quick-preview").version
+          if ($Matches.version -ne $packageVersion) {
+            throw "Tag version $($Matches.version) does not match Cargo.toml version $packageVersion."
+          }
+
+      - name: Install the Rust MSVC target
+        shell: pwsh
+        run: |
+          rustup default stable
+          rustup target add x86_64-pc-windows-msvc
+
+      - name: Test
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+
+      - name: Build
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
+
+      - name: Package release files
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $archiveName = "QuickPreview-$tag-windows-x64.zip"
+          $dist = New-Item -ItemType Directory -Path dist -Force
+          $executable = Join-Path $dist "QuickPreview.exe"
+          Copy-Item "target/x86_64-pc-windows-msvc/release/QuickPreview.exe" $executable
+          Compress-Archive -Path $executable -DestinationPath (Join-Path $dist $archiveName)
+
+          @(
+            "{0}  QuickPreview.exe" -f (Get-FileHash $executable -Algorithm SHA256).Hash.ToLowerInvariant()
+            "{0}  $archiveName" -f (Get-FileHash (Join-Path $dist $archiveName) -Algorithm SHA256).Hash.ToLowerInvariant()
+          ) | Set-Content (Join-Path $dist "SHA256SUMS.txt") -Encoding ascii
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $files = @(
+            "dist/QuickPreview.exe"
+            "dist/QuickPreview-$tag-windows-x64.zip"
+            "dist/SHA256SUMS.txt"
+          )
+
+          gh release view $tag --repo "${{ github.repository }}" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @files --repo "${{ github.repository }}" --clobber
+          } else {
+            gh release create $tag @files `
+              --repo "${{ github.repository }}" `
+              --verify-tag `
+              --generate-notes `
+              --latest `
+              --title "QuickPreview $tag"
+          }

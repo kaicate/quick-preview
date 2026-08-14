@@ -30,6 +30,17 @@ cargo build --release
 The application artwork is stored in `assets/QuickPreview.png`, and the Windows
 executable embeds `assets/QuickPreview.ico`.
 
+## Release
+
+Pushing a tag whose version matches `Cargo.toml` automatically builds the app
+on Windows x64 and publishes the executable, a ZIP archive, and SHA-256
+checksums to a GitHub Release. Release tags must use `vMAJOR.MINOR.PATCH`:
+
+```bash
+git tag v0.1.4
+git push origin v0.1.4
+```
+
 ## Keyboard shortcuts
 
 - `Ctrl+O`: open
