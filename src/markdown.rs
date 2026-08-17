@@ -1,6 +1,7 @@
 use std::{fs, io::Write, ops::Range, path::Path};
 
-use pulldown_cmark::{html, Event, Options, Parser};
+use math_core::{LatexToMathML, MathCoreConfig, MathDisplay};
+use pulldown_cmark::{html, CowStr, Event, Options, Parser};
 
 use crate::{
     atomic_save::AtomicWriter,
@@ -77,10 +78,18 @@ impl MarkdownDocument {
     pub fn preview_html(&self, revision: u64) -> String {
         let mut body = String::new();
         let mut sources = Vec::with_capacity(self.blocks.len());
+        let math = LatexToMathML::new(MathCoreConfig {
+            annotation: true,
+            ..Default::default()
+        })
+        .ok();
         for block in &self.blocks {
             let source = &self.source[block.range.clone()];
             let mut rendered = String::new();
-            html::push_html(&mut rendered, Parser::new_ext(source, markdown_options()));
+            let normalized = normalize_chatgpt_math(source);
+            let events = Parser::new_ext(&normalized, markdown_options())
+                .map(|event| render_math_event(event, math.as_ref()));
+            html::push_html(&mut rendered, events);
             body.push_str(&format!(
                 "<section class=\"qp-block\" data-node-id=\"{}\">{}</section>",
                 block.id, rendered
@@ -93,6 +102,58 @@ impl MarkdownDocument {
         let body = sanitize_preview_fragment(&body);
         preview_shell("Markdown preview", &body, revision, &sources_json, true)
     }
+}
+
+fn render_math_event<'a>(event: Event<'a>, converter: Option<&LatexToMathML>) -> Event<'a> {
+    let (latex, display) = match event {
+        Event::InlineMath(latex) => (latex, MathDisplay::Inline),
+        Event::DisplayMath(latex) => (latex, MathDisplay::Block),
+        other => return other,
+    };
+    if let Some(mathml) = converter
+        .and_then(|converter| converter.convert_with_local_state(&latex, display).ok())
+        .map(|result| result.mathml)
+    {
+        Event::Html(CowStr::Boxed(mathml.into_boxed_str()))
+    } else {
+        let fallback = if display == MathDisplay::Block {
+            format!("$${latex}$$")
+        } else {
+            format!("${latex}$")
+        };
+        Event::Text(CowStr::Boxed(fallback.into_boxed_str()))
+    }
+}
+
+fn normalize_chatgpt_math(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut fence: Option<char> = None;
+    for line in source.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let trimmed = content.trim();
+        let fence_marker = content.trim_start();
+        if fence.is_none() {
+            if fence_marker.starts_with("```") {
+                fence = Some('`');
+            } else if fence_marker.starts_with("~~~") {
+                fence = Some('~');
+            }
+        } else if fence.is_some_and(|marker| {
+            let marker = marker.to_string().repeat(3);
+            fence_marker.starts_with(&marker)
+        }) {
+            fence = None;
+        }
+        if fence.is_none() && matches!(trimmed, r"\[" | r"\]") {
+            output.push_str("$$");
+            if line.ends_with('\n') {
+                output.push('\n');
+            }
+        } else {
+            output.push_str(line);
+        }
+    }
+    output
 }
 
 pub fn markdown_options() -> Options {
@@ -168,16 +229,17 @@ pub(crate) fn preview_shell(
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
 <title>{title}</title><style>
 :root{{color-scheme:light dark;font:15px/1.55 system-ui,sans-serif}}body{{max-width:980px;margin:0 auto;padding:24px;background:Canvas;color:CanvasText}}img{{max-width:100%}}
+@media(prefers-color-scheme:dark){{html,body,textarea.qp-editor{{background:#2C2C2C}}}}
 .qp-block{{border:1px solid transparent;border-radius:5px;padding:2px 7px;margin:1px -8px}}.qp-block:hover{{border-color:#6aa9ff}}
 textarea.qp-editor{{box-sizing:border-box;width:100%;min-height:7em;resize:vertical;font:14px/1.45 Consolas,monospace;background:Canvas;color:CanvasText;border:1px solid #888}}
 table{{border-collapse:collapse}}th,td{{border:1px solid #888;padding:.3em .6em}}pre{{overflow:auto;padding:12px;background:#8882}}
 .math{{font-family:'Cambria Math',serif}}a{{color:#2785d8}}</style></head><body data-mode="{mode}">{body}<script>
 (()=>{{'use strict';const revision={revision};const sources=new Map({sources_json});
-const send=(id,text)=>chrome.webview.postMessage({{type:'edit',documentRevision:revision,nodeId:Number(id),text}});
+const send=(id,text)=>chrome.webview.postMessage({{type:'edit',documentRevision:revision,nodeId:Number(id),text,scrollX:window.scrollX,scrollY:window.scrollY}});
 document.addEventListener('click',e=>{{const link=e.target.closest('a');if(link){{if(e.ctrlKey){{e.preventDefault();chrome.webview.postMessage({{type:'openLink',documentRevision:revision,nodeId:0,text:link.href}})}}else e.preventDefault();return}}
-if(document.body.dataset.mode==='markdown'){{const block=e.target.closest('.qp-block');if(!block||block.querySelector('textarea'))return;const id=Number(block.dataset.nodeId);const area=document.createElement('textarea');let committed=false;area.className='qp-editor';area.value=sources.get(id)||'';block.replaceChildren(area);area.focus();area.addEventListener('keydown',x=>{{if(x.ctrlKey&&x.key==='Enter'){{x.preventDefault();committed=true;send(id,area.value)}}}});area.addEventListener('blur',()=>{{if(!committed)send(id,area.value)}},{{once:true}})}}else{{const node=e.target.closest('[data-qp-edit]');if(!node)return;node.contentEditable='true';node.focus()}}}});
+if(document.body.dataset.mode==='markdown'){{const block=e.target.closest('.qp-block');if(!block||block.querySelector('textarea'))return;const id=Number(block.dataset.nodeId);const area=document.createElement('textarea');let committed=false;area.className='qp-editor';area.value=sources.get(id)||'';block.replaceChildren(area);area.focus();area.addEventListener('keydown',x=>{{if(x.key==='Escape'){{x.preventDefault();x.stopPropagation();committed=true;chrome.webview.postMessage({{type:'cancelEdit',documentRevision:revision,scrollX:window.scrollX,scrollY:window.scrollY}})}}else if(x.ctrlKey&&x.key==='Enter'){{x.preventDefault();committed=true;send(id,area.value)}}else if(x.ctrlKey&&x.key.toLowerCase()==='s'){{x.preventDefault();x.stopPropagation();committed=true;send(id,area.value);chrome.webview.postMessage({{type:'save'}})}}}});area.addEventListener('blur',()=>{{if(!committed)send(id,area.value)}},{{once:true}})}}else{{const node=e.target.closest('[data-qp-edit]');if(!node)return;node.contentEditable='true';node.focus()}}}});
 document.addEventListener('focusout',e=>{{const node=e.target.closest?.('[data-qp-edit]');if(node&&node.contentEditable==='true'){{node.contentEditable='false';send(node.dataset.nodeId,node.textContent)}}}});
-document.addEventListener('keydown',e=>{{const node=e.target.closest?.('[data-qp-edit]');if(node&&e.ctrlKey&&e.key==='Enter'){{e.preventDefault();node.blur()}}}});
+document.addEventListener('keydown',e=>{{const node=e.target.closest?.('[data-qp-edit]');if(e.key==='Escape'&&node&&node.contentEditable==='true'){{e.preventDefault();chrome.webview.postMessage({{type:'cancelEdit',documentRevision:revision,scrollX:window.scrollX,scrollY:window.scrollY}});return}}if(e.ctrlKey&&e.key.toLowerCase()==='s'){{e.preventDefault();if(node&&node.contentEditable==='true'){{node.contentEditable='false';send(node.dataset.nodeId,node.textContent)}}chrome.webview.postMessage({{type:'save'}});return}}if(node&&e.ctrlKey&&e.key==='Enter'){{e.preventDefault();node.blur()}}}});
 }})();</script></body></html>"#
     )
 }
@@ -218,5 +280,29 @@ mod tests {
         };
         let preview = doc.preview_html(0);
         assert!(!preview.contains("<script>alert(1)</script>"));
+    }
+
+    #[test]
+    fn renders_dollar_and_chatgpt_display_math_as_mathml() {
+        let source = "Inline $x^2$.\n\n\\[\n\\frac{a}{b}\n\\]\n".to_string();
+        let doc = MarkdownDocument {
+            blocks: source_blocks(&source),
+            source,
+            encoding: EncodingInfo {
+                encoding: TextEncoding::Utf8,
+                bom: false,
+            },
+        };
+        let preview = doc.preview_html(0);
+        assert!(preview.contains("<math><semantics><msup>"));
+        assert!(preview.contains("<math display=\"block\""));
+        assert!(preview.contains("<mfrac>"));
+        assert!(preview.contains("cancelEdit"));
+    }
+
+    #[test]
+    fn chatgpt_math_delimiters_inside_code_fences_stay_literal() {
+        let source = "```text\n\\[\nx\n\\]\n```\n";
+        assert_eq!(normalize_chatgpt_math(source), source);
     }
 }

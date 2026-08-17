@@ -1,5 +1,26 @@
 use std::{env, fs, path::PathBuf, process::Command};
 
+fn create_icon(source: &PathBuf, destination: &PathBuf) {
+    let image = image::open(source)
+        .unwrap_or_else(|error| panic!("could not load {}: {error}", source.display()))
+        .resize_exact(256, 256, image::imageops::FilterType::Lanczos3);
+    image
+        .save_with_format(destination, image::ImageFormat::Ico)
+        .unwrap_or_else(|error| panic!("could not write {}: {error}", destination.display()));
+}
+
+fn resource_compiler_path(path: &PathBuf) -> String {
+    let value = path.to_string_lossy();
+    #[cfg(unix)]
+    if let Some(rest) = value.strip_prefix("/mnt/") {
+        if rest.as_bytes().get(1) == Some(&b'/') {
+            let drive = rest[..1].to_ascii_uppercase();
+            return format!("{drive}:\\{}", rest[2..].replace('/', "\\"));
+        }
+    }
+    value.into_owned()
+}
+
 fn resolve_resource_compiler() -> PathBuf {
     if let Some(path) = env::var_os("PATH") {
         for directory in env::split_paths(&path) {
@@ -34,8 +55,20 @@ fn resolve_resource_compiler() -> PathBuf {
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let icon_path = manifest_dir.join("assets").join("QuickPreview.ico");
+    let file_icons = [
+        (101, "csv_icon.png"),
+        (102, "tsv_icon.png"),
+        (103, "markdown_icon.png"),
+        (104, "html_icon.png"),
+    ];
 
     println!("cargo:rerun-if-changed={}", icon_path.display());
+    for (_, icon) in file_icons {
+        println!(
+            "cargo:rerun-if-changed={}",
+            manifest_dir.join("assets").join(icon).display()
+        );
+    }
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -44,19 +77,23 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let resource_script = out_dir.join("QuickPreview.rc");
     let compiled_resource = out_dir.join("QuickPreview.res");
-    let escaped_icon_path = icon_path.to_string_lossy().replace('\\', "\\\\");
+    let escaped_icon_path = resource_compiler_path(&icon_path).replace('\\', "\\\\");
+    let mut resource_contents = format!("1 ICON \"{escaped_icon_path}\"\n");
+    for (resource_id, file_name) in file_icons {
+        let generated = out_dir.join(format!("{resource_id}.ico"));
+        create_icon(&manifest_dir.join("assets").join(file_name), &generated);
+        let generated = resource_compiler_path(&generated).replace('\\', "\\\\");
+        resource_contents.push_str(&format!("{resource_id} ICON \"{generated}\"\n"));
+    }
 
-    fs::write(
-        &resource_script,
-        format!("1 ICON \"{escaped_icon_path}\"\n"),
-    )
-    .expect("could not write the Windows resource script");
+    fs::write(&resource_script, resource_contents)
+        .expect("could not write the Windows resource script");
 
     let output = Command::new(resolve_resource_compiler())
         .arg("/nologo")
         .arg("/fo")
-        .arg(&compiled_resource)
-        .arg(&resource_script)
+        .arg(resource_compiler_path(&compiled_resource))
+        .arg(resource_compiler_path(&resource_script))
         .output()
         .expect("could not run rc.exe");
 

@@ -92,15 +92,28 @@ pub struct DocumentSession {
 
 impl DocumentSession {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_owned();
-        let kind = DocumentKind::from_path(&path)?;
-        let fingerprint = FileFingerprint::read(&path)?;
-        let limit = if matches!(kind, DocumentKind::Csv | DocumentKind::Tsv) {
+        Self::open_impl(path.as_ref(), true)
+    }
+
+    pub fn open_without_size_limit(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_impl(path.as_ref(), false)
+    }
+
+    pub fn size_limit_for(path: &Path) -> Result<u64> {
+        let kind = DocumentKind::from_path(path)?;
+        Ok(if matches!(kind, DocumentKind::Csv | DocumentKind::Tsv) {
             DELIMITED_FILE_LIMIT
         } else {
             WEB_PREVIEW_LIMIT
-        };
-        if fingerprint.size > limit {
+        })
+    }
+
+    fn open_impl(path: &Path, enforce_size_limit: bool) -> Result<Self> {
+        let path = path.to_owned();
+        let kind = DocumentKind::from_path(&path)?;
+        let fingerprint = FileFingerprint::read(&path)?;
+        let limit = Self::size_limit_for(&path)?;
+        if enforce_size_limit && fingerprint.size > limit {
             return Err(PreviewError::FileTooLarge {
                 actual: fingerprint.size,
                 limit,

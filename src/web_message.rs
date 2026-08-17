@@ -4,7 +4,7 @@ use crate::{PreviewError, Result};
 
 pub const MAX_WEB_EDIT_BYTES: usize = 4 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WebEditMessage {
     #[serde(rename = "type")]
@@ -12,6 +12,10 @@ pub struct WebEditMessage {
     pub document_revision: u64,
     pub node_id: u64,
     pub text: String,
+    #[serde(default)]
+    pub scroll_x: f64,
+    #[serde(default)]
+    pub scroll_y: f64,
 }
 
 impl WebEditMessage {
@@ -42,5 +46,12 @@ mod tests {
     fn rejects_stale_messages() {
         let json = r#"{"type":"edit","documentRevision":2,"nodeId":1,"text":"x"}"#;
         assert!(WebEditMessage::parse(json, 3).is_err());
+    }
+
+    #[test]
+    fn accepts_scroll_position_from_preview() {
+        let json = r#"{"type":"edit","documentRevision":2,"nodeId":1,"text":"x","scrollX":12.5,"scrollY":240}"#;
+        let message = WebEditMessage::parse(json, 2).unwrap();
+        assert_eq!((message.scroll_x, message.scroll_y), (12.5, 240.0));
     }
 }

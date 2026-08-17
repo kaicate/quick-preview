@@ -33,7 +33,11 @@ use windows::{
         System::{
             Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED},
             LibraryLoader::GetModuleHandleW,
-            Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD},
+            Registry::{
+                RegCloseKey, RegCreateKeyExW, RegGetValueW, RegSetValueExW, HKEY,
+                HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+                RRF_RT_REG_DWORD,
+            },
         },
         UI::{
             Controls::{
@@ -42,12 +46,12 @@ use windows::{
             },
             HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2},
             Input::KeyboardAndMouse::{
-                GetKeyState, SetFocus, VK_CONTROL, VK_DOWN, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT,
-                VK_UP,
+                GetKeyState, SetFocus, VK_DOWN, VK_ESCAPE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT,
+                VK_SHIFT, VK_UP,
             },
             Shell::{
-                DefSubclassProc, DragAcceptFiles, DragFinish, DragQueryFileW, SetWindowSubclass,
-                ShellExecuteW, HDROP,
+                DefSubclassProc, DragAcceptFiles, DragFinish, DragQueryFileW, SHChangeNotify,
+                SetWindowSubclass, ShellExecuteW, HDROP, SHCNE_ASSOCCHANGED, SHCNF_IDLIST,
             },
             WindowsAndMessaging::*,
         },
@@ -56,7 +60,12 @@ use windows::{
 
 const WM_DOCUMENT_READY: u32 = WM_APP + 1;
 const WM_WEB_MESSAGE: u32 = WM_APP + 2;
+const WM_CANCEL_CELL_EDIT: u32 = WM_APP + 3;
 const EDIT_ID: i32 = 4101;
+const COMMAND_OPEN: u16 = 4201;
+const COMMAND_SAVE: u16 = 4202;
+const COMMAND_UNDO: u16 = 4203;
+const COMMAND_REDO: u16 = 4204;
 const CELL_WIDTH: f32 = 160.0;
 const CELL_HEIGHT: f32 = 28.0;
 const HEADER_WIDTH: f32 = 58.0;
@@ -66,6 +75,7 @@ pub fn run() -> Result<()> {
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let _ = register_file_associations();
         let instance = GetModuleHandleW(None)?;
         let class = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
@@ -101,6 +111,12 @@ pub fn run() -> Result<()> {
         if let Some(path) = std::env::args_os().nth(1) {
             begin_open(hwnd, PathBuf::from(path));
         }
+        let accelerators = CreateAcceleratorTableW(&[
+            accelerator(b'O', COMMAND_OPEN),
+            accelerator(b'S', COMMAND_SAVE),
+            accelerator(b'Z', COMMAND_UNDO),
+            accelerator(b'Y', COMMAND_REDO),
+        ])?;
         let mut message = MSG::default();
         loop {
             let value = GetMessageW(&mut message, None, 0, 0).0;
@@ -110,9 +126,12 @@ pub fn run() -> Result<()> {
             if value == 0 {
                 break;
             }
-            let _ = TranslateMessage(&message);
-            DispatchMessageW(&message);
+            if TranslateAcceleratorW(hwnd, accelerators, &message) == 0 {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
         }
+        let _ = DestroyAcceleratorTable(accelerators);
         Ok(())
     }
 }
@@ -124,11 +143,13 @@ struct AppState {
     webview: Option<WebPreview>,
     selected_row: usize,
     selected_column: usize,
+    cell_selected: bool,
     first_row: usize,
     first_column: usize,
     editor: Option<HWND>,
     loading: bool,
     dark_mode: bool,
+    pending_web_scroll: Option<(f64, f64)>,
 }
 
 impl AppState {
@@ -141,11 +162,13 @@ impl AppState {
             webview: None,
             selected_row: 0,
             selected_column: 0,
+            cell_selected: false,
             first_row: 0,
             first_column: 0,
             editor: None,
             loading: false,
             dark_mode,
+            pending_web_scroll: None,
         })
     }
 
@@ -173,8 +196,10 @@ impl AppState {
                 self.document = Some(document);
                 self.selected_row = 0;
                 self.selected_column = 0;
+                self.cell_selected = true;
                 self.first_row = 0;
                 self.first_column = 0;
+                self.ensure_grid_rows();
                 self.refresh_view();
                 self.update_title();
             }
@@ -211,7 +236,7 @@ impl AppState {
             }
         }
         if let Some(webview) = &self.webview {
-            if let Err(error) = webview.navigate_to_string(&html) {
+            if let Err(error) = webview.navigate_to_string(&html, self.pending_web_scroll.take()) {
                 show_error(self.hwnd, &error.to_string());
             }
         }
@@ -274,7 +299,7 @@ impl AppState {
     }
 
     fn begin_cell_edit(&mut self) {
-        if self.editor.is_some() {
+        if self.editor.is_some() || !self.cell_selected {
             return;
         }
         let Some(DocumentSession {
@@ -341,18 +366,54 @@ impl AppState {
                 Err(error) => show_error(self.hwnd, &error.to_string()),
             }
         }
+        self.clamp_horizontal_offset();
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+    }
+
+    fn cancel_cell_edit(&mut self) {
+        if let Some(edit) = self.editor.take() {
+            unsafe {
+                let _ = DestroyWindow(edit);
+                let _ = SetFocus(Some(self.hwnd));
+            }
+        }
+        self.cell_selected = false;
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
         }
     }
 
     fn handle_web_message(&mut self, json: String) {
-        let Some(document) = self.document.as_mut() else {
-            return;
-        };
         let value: serde_json::Value = match serde_json::from_str(&json) {
             Ok(value) => value,
             Err(_) => return,
+        };
+        if value.get("type").and_then(|value| value.as_str()) == Some("save") {
+            self.save();
+            return;
+        }
+        if value.get("type").and_then(|value| value.as_str()) == Some("cancelEdit") {
+            let revision = value
+                .get("documentRevision")
+                .and_then(|value| value.as_u64());
+            if revision == self.document.as_ref().map(|document| document.revision) {
+                let x = value
+                    .get("scrollX")
+                    .and_then(|value| value.as_f64())
+                    .unwrap_or(0.0);
+                let y = value
+                    .get("scrollY")
+                    .and_then(|value| value.as_f64())
+                    .unwrap_or(0.0);
+                self.pending_web_scroll = Some((x, y));
+                self.refresh_view();
+            }
+            return;
+        }
+        let Some(document) = self.document.as_mut() else {
+            return;
         };
         if value.get("type").and_then(|v| v.as_str()) == Some("openLink") {
             let revision = value.get("documentRevision").and_then(|v| v.as_u64());
@@ -393,6 +454,7 @@ impl AppState {
                 return;
             }
         };
+        let scroll = (message.scroll_x, message.scroll_y);
         let edit = match &mut document.document {
             FormatDocument::Markdown(markdown) => {
                 let start = markdown
@@ -434,6 +496,7 @@ impl AppState {
         };
         match edit {
             Ok(command) => {
+                self.pending_web_scroll = Some(scroll);
                 if matches!(&command, EditCommand::Source { before, after, .. } if before == after)
                 {
                     self.refresh_view();
@@ -494,6 +557,7 @@ impl AppState {
         } else {
             document.mark_edited();
             self.update_title();
+            self.clamp_horizontal_offset();
             self.refresh_view();
         }
     }
@@ -506,6 +570,102 @@ impl AppState {
             top: y as i32,
             right: (x + CELL_WIDTH) as i32,
             bottom: (y + CELL_HEIGHT) as i32,
+        }
+    }
+
+    fn visible_column_count(&self) -> usize {
+        let width = client_size(self.hwnd).width as f32;
+        ((width - HEADER_WIDTH).max(CELL_WIDTH) / CELL_WIDTH)
+            .floor()
+            .max(1.0) as usize
+    }
+
+    fn visible_row_count(&self) -> usize {
+        let height = client_size(self.hwnd).height as f32;
+        ((height - HEADER_HEIGHT).max(CELL_HEIGHT) / CELL_HEIGHT)
+            .ceil()
+            .max(1.0) as usize
+            + 1
+    }
+
+    fn maximum_first_column(&self) -> usize {
+        let columns = self
+            .document
+            .as_ref()
+            .and_then(|document| match &document.document {
+                FormatDocument::Delimited(grid) => Some(grid.estimated_column_count()),
+                _ => None,
+            })
+            .unwrap_or(0);
+        columns.saturating_sub(self.visible_column_count())
+    }
+
+    fn clamp_horizontal_offset(&mut self) {
+        let columns = self
+            .document
+            .as_ref()
+            .and_then(|document| match &document.document {
+                FormatDocument::Delimited(grid) => Some(grid.estimated_column_count()),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let page = self.visible_column_count();
+        self.first_column = self.first_column.min(columns.saturating_sub(page));
+    }
+
+    fn ensure_grid_rows(&mut self) {
+        let visible_rows = self.visible_row_count();
+        let visible_columns = self.visible_column_count();
+        let mut error = None;
+        if let Some(DocumentSession {
+            document: FormatDocument::Delimited(grid),
+            ..
+        }) = self.document.as_mut()
+        {
+            if let Some(row_count) = grid.known_row_count() {
+                self.first_row = self.first_row.min(row_count.saturating_sub(1));
+            }
+            if let Err(current) = grid.ensure_rows_around(self.first_row, visible_rows) {
+                error = Some(current);
+            } else if let Some(row_count) = grid.known_row_count() {
+                let first_row = self.first_row.min(row_count.saturating_sub(1));
+                if first_row != self.first_row {
+                    self.first_row = first_row;
+                    if let Err(current) = grid.ensure_rows_around(self.first_row, visible_rows) {
+                        error = Some(current);
+                    }
+                }
+            }
+            if error.is_none() {
+                if let Err(current) = grid.ensure_columns_around(self.first_column, visible_columns)
+                {
+                    error = Some(current);
+                }
+            }
+        }
+        self.clamp_horizontal_offset();
+        if let Some(error) = error {
+            show_error(self.hwnd, &error.to_string());
+        }
+    }
+
+    fn scroll_horizontally(&mut self, command: i32) {
+        let page = self.visible_column_count();
+        let maximum = self.maximum_first_column();
+        self.first_column = match command {
+            value if value == SB_LINELEFT.0 => self.first_column.saturating_sub(1),
+            value if value == SB_LINERIGHT.0 => self.first_column.saturating_add(1),
+            value if value == SB_PAGELEFT.0 => self.first_column.saturating_sub(page),
+            value if value == SB_PAGERIGHT.0 => self.first_column.saturating_add(page),
+            value if value == SB_LEFT.0 => 0,
+            value if value == SB_RIGHT.0 => maximum,
+            _ => self.first_column,
+        }
+        .min(maximum);
+        self.ensure_grid_rows();
+        self.clamp_horizontal_offset();
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
         }
     }
 }
@@ -591,7 +751,7 @@ impl GridRenderer {
         unsafe {
             let (background, text, muted, line, header, selection) = if state.dark_mode {
                 (
-                    color(0.075, 0.082, 0.094, 1.0),
+                    color(44.0 / 255.0, 44.0 / 255.0, 44.0 / 255.0, 1.0),
                     color(0.91, 0.92, 0.94, 1.0),
                     color(0.62, 0.65, 0.70, 1.0),
                     color(0.25, 0.27, 0.31, 1.0),
@@ -653,7 +813,7 @@ impl GridRenderer {
                         break;
                     }
                     let y = HEADER_HEIGHT + visible_row as f32 * CELL_HEIGHT;
-                    if row == state.selected_row {
+                    if state.cell_selected && row == state.selected_row {
                         self.target.FillRectangle(
                             &D2D_RECT_F {
                                 left: 0.0,
@@ -676,11 +836,16 @@ impl GridRenderer {
                             bottom: y + CELL_HEIGHT,
                         },
                     );
-                    let values = grid.row(row).unwrap_or_default();
+                    let values = grid
+                        .row_range(row, state.first_column, columns)
+                        .unwrap_or_default();
                     for visible_column in 0..columns {
                         let column = state.first_column + visible_column;
                         let x = HEADER_WIDTH + visible_column as f32 * CELL_WIDTH;
-                        if row == state.selected_row && column == state.selected_column {
+                        if state.cell_selected
+                            && row == state.selected_row
+                            && column == state.selected_column
+                        {
                             self.target.FillRectangle(
                                 &D2D_RECT_F {
                                     left: x,
@@ -691,7 +856,7 @@ impl GridRenderer {
                                 &self.selection,
                             );
                         }
-                        if let Some(value) = values.get(column) {
+                        if let Some(value) = values.get(visible_column) {
                             draw_text(
                                 &self.target,
                                 &self.text_format,
@@ -975,8 +1140,15 @@ impl WebPreview {
             allow_preview_navigation,
         })
     }
-    fn navigate_to_string(&self, html: &str) -> Result<()> {
-        let wide = CoTaskMemPWSTR::from(html);
+    fn navigate_to_string(&self, html: &str, scroll: Option<(f64, f64)>) -> Result<()> {
+        let mut restored_html = None;
+        if let Some((x, y)) = scroll.filter(|(x, y)| x.is_finite() && y.is_finite()) {
+            let restore = format!(
+                "<script>requestAnimationFrame(()=>window.scrollTo({x},{y}))</script></body>"
+            );
+            restored_html = Some(html.replacen("</body>", &restore, 1));
+        }
+        let wide = CoTaskMemPWSTR::from(restored_html.as_deref().unwrap_or(html));
         self.allow_preview_navigation.store(true, Ordering::SeqCst);
         let result = unsafe { self.webview.NavigateToString(*wide.as_ref().as_pcwstr()) };
         if result.is_err() {
@@ -1025,11 +1197,16 @@ extern "system" fn window_proc(
                 state.handle_web_message(*message);
                 LRESULT(0)
             }
+            WM_CANCEL_CELL_EDIT => {
+                state.cancel_cell_edit();
+                LRESULT(0)
+            }
             WM_SIZE => {
                 state.renderer.resize(hwnd);
                 if let Some(webview) = &state.webview {
                     webview.resize(hwnd);
                 }
+                state.ensure_grid_rows();
                 LRESULT(0)
             }
             WM_SETTINGCHANGE => {
@@ -1052,6 +1229,25 @@ extern "system" fn window_proc(
                 DragFinish(drop);
                 LRESULT(0)
             }
+            WM_COMMAND if (wparam.0 & 0xffff) as u16 == COMMAND_OPEN => {
+                if let Some(path) = open_dialog(hwnd) {
+                    begin_open(hwnd, path);
+                }
+                LRESULT(0)
+            }
+            WM_COMMAND if (wparam.0 & 0xffff) as u16 == COMMAND_SAVE => {
+                state.commit_cell_edit();
+                state.save();
+                LRESULT(0)
+            }
+            WM_COMMAND if (wparam.0 & 0xffff) as u16 == COMMAND_UNDO => {
+                state.undo(false);
+                LRESULT(0)
+            }
+            WM_COMMAND if (wparam.0 & 0xffff) as u16 == COMMAND_REDO => {
+                state.undo(true);
+                LRESULT(0)
+            }
             WM_COMMAND if ((wparam.0 >> 16) & 0xffff) as u32 == EN_KILLFOCUS => {
                 state.commit_cell_edit();
                 LRESULT(0)
@@ -1071,36 +1267,55 @@ extern "system" fn window_proc(
             }
             WM_MOUSEWHEEL => {
                 let delta = ((wparam.0 >> 16) as i16) as i32;
-                state.first_row = if delta > 0 {
-                    state.first_row.saturating_sub(3)
+                if GetKeyState(VK_SHIFT.0 as i32) < 0 {
+                    let command = if delta > 0 {
+                        SB_LINELEFT.0
+                    } else {
+                        SB_LINERIGHT.0
+                    };
+                    for _ in 0..3 {
+                        state.scroll_horizontally(command);
+                    }
                 } else {
-                    state.first_row.saturating_add(3)
+                    state.first_row = if delta > 0 {
+                        state.first_row.saturating_sub(3)
+                    } else {
+                        state.first_row.saturating_add(3)
+                    };
+                    state.ensure_grid_rows();
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEHWHEEL => {
+                let delta = ((wparam.0 >> 16) as i16) as i32;
+                let command = if delta > 0 {
+                    SB_LINERIGHT.0
+                } else {
+                    SB_LINELEFT.0
                 };
-                let _ = InvalidateRect(Some(hwnd), None, false);
+                for _ in 0..3 {
+                    state.scroll_horizontally(command);
+                }
                 LRESULT(0)
             }
             WM_KEYDOWN => {
-                let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
                 match wparam.0 as u16 {
-                    key if ctrl && key == b'O' as u16 => {
-                        if let Some(path) = open_dialog(hwnd) {
-                            begin_open(hwnd, path);
-                        }
-                    }
-                    key if ctrl && key == b'S' as u16 => state.save(),
-                    key if ctrl && key == b'Z' as u16 => state.undo(false),
-                    key if ctrl && key == b'Y' as u16 => state.undo(true),
                     key if key == VK_F2.0 => state.begin_cell_edit(),
                     key if key == VK_LEFT.0 => {
+                        state.cell_selected = true;
                         state.selected_column = state.selected_column.saturating_sub(1)
                     }
                     key if key == VK_RIGHT.0 => {
+                        state.cell_selected = true;
                         state.selected_column = state.selected_column.saturating_add(1)
                     }
                     key if key == VK_UP.0 => {
+                        state.cell_selected = true;
                         state.selected_row = state.selected_row.saturating_sub(1)
                     }
                     key if key == VK_DOWN.0 => {
+                        state.cell_selected = true;
                         state.selected_row = state.selected_row.saturating_add(1)
                     }
                     _ => return DefWindowProcW(hwnd, message, wparam, lparam),
@@ -1144,6 +1359,9 @@ unsafe extern "system" fn edit_subclass_proc(
     _subclass_id: usize,
     _reference: usize,
 ) -> LRESULT {
+    if message == WM_CHAR && wparam.0 as u16 == VK_ESCAPE.0 {
+        return LRESULT(0);
+    }
     if message == WM_KEYDOWN && wparam.0 as u16 == VK_RETURN.0 {
         if let Ok(parent) = unsafe { GetParent(hwnd) } {
             unsafe {
@@ -1152,10 +1370,19 @@ unsafe extern "system" fn edit_subclass_proc(
         }
         return LRESULT(0);
     }
+    if message == WM_KEYDOWN && wparam.0 as u16 == VK_ESCAPE.0 {
+        if let Ok(parent) = unsafe { GetParent(hwnd) } {
+            unsafe {
+                let _ = PostMessageW(Some(parent), WM_CANCEL_CELL_EDIT, WPARAM(0), LPARAM(0));
+            }
+        }
+        return LRESULT(0);
+    }
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
 fn begin_open(hwnd: HWND, path: PathBuf) {
+    let mut bypass_size_limit = false;
     unsafe {
         let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState;
         if !pointer.is_null() {
@@ -1175,13 +1402,39 @@ fn begin_open(hwnd: HWND, path: PathBuf) {
             {
                 return;
             }
+            if let (Ok(metadata), Ok(limit)) = (
+                std::fs::metadata(&path),
+                DocumentSession::size_limit_for(&path),
+            ) {
+                if metadata.len() > limit {
+                    let prompt = wide(&format!(
+                        "ファイルサイズは {} で、通常の上限 {} を超えています。\n開く処理に時間がかかったり、多くのメモリを使用する可能性があります。\n\nこのまま開きますか？",
+                        format_file_size(metadata.len()),
+                        format_file_size(limit)
+                    ));
+                    if MessageBoxW(
+                        Some(hwnd),
+                        PCWSTR(prompt.as_ptr()),
+                        w!("QuickPreview"),
+                        MB_YESNO | MB_ICONWARNING,
+                    ) != IDYES
+                    {
+                        return;
+                    }
+                    bypass_size_limit = true;
+                }
+            }
             (*pointer).loading = true;
             (*pointer).webview = None;
         }
     }
     let raw_hwnd = hwnd.0 as usize;
     thread::spawn(move || {
-        let result = DocumentSession::open(path);
+        let result = if bypass_size_limit {
+            DocumentSession::open_without_size_limit(path)
+        } else {
+            DocumentSession::open(path)
+        };
         let pointer = Box::into_raw(Box::new(result));
         unsafe {
             let target = HWND(raw_hwnd as *mut c_void);
@@ -1199,8 +1452,20 @@ fn begin_open(hwnd: HWND, path: PathBuf) {
     });
 }
 
+fn format_file_size(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 fn select_cell(state: &mut AppState, x: i32, y: i32) {
     if x >= HEADER_WIDTH as i32 && y >= HEADER_HEIGHT as i32 {
+        state.cell_selected = true;
         state.selected_column =
             state.first_column + ((x as f32 - HEADER_WIDTH) / CELL_WIDTH) as usize;
         state.selected_row = state.first_row + ((y as f32 - HEADER_HEIGHT) / CELL_HEIGHT) as usize;
@@ -1298,6 +1563,116 @@ fn apply_control_theme(hwnd: HWND, dark_mode: bool) {
             SetWindowTheme(hwnd, PCWSTR::null(), PCWSTR::null())
         };
     }
+}
+fn accelerator(key: u8, command: u16) -> ACCEL {
+    ACCEL {
+        fVirt: FVIRTKEY | FCONTROL,
+        key: key as u16,
+        cmd: command,
+    }
+}
+fn register_file_associations() -> bool {
+    let Ok(executable) = std::env::current_exe() else {
+        return false;
+    };
+    let executable = executable.to_string_lossy();
+    let open_command = format!("\"{executable}\" \"%1\"");
+    let capabilities = r"Software\QuickPreview\Capabilities";
+    let associations = [
+        (".csv", "QuickPreview.csv", "CSV document", 101),
+        (".tsv", "QuickPreview.tsv", "TSV document", 102),
+        (".md", "QuickPreview.markdown", "Markdown document", 103),
+        (
+            ".markdown",
+            "QuickPreview.markdown",
+            "Markdown document",
+            103,
+        ),
+        (".html", "QuickPreview.html", "HTML document", 104),
+        (".htm", "QuickPreview.html", "HTML document", 104),
+    ];
+    let mut success = true;
+    success &= set_registry_string(
+        r"Software\RegisteredApplications",
+        Some("QuickPreview"),
+        capabilities,
+    );
+    success &= set_registry_string(capabilities, Some("ApplicationName"), "QuickPreview");
+    success &= set_registry_string(
+        capabilities,
+        Some("ApplicationDescription"),
+        "Lightweight preview and editor for CSV, TSV, Markdown, and HTML",
+    );
+    success &= set_registry_string(
+        r"Software\Classes\Applications\QuickPreview.exe\shell\open\command",
+        None,
+        &open_command,
+    );
+    success &= set_registry_string(
+        r"Software\Classes\Applications\QuickPreview.exe",
+        Some("ApplicationIcon"),
+        &format!("\"{executable}\",0"),
+    );
+
+    for (extension, prog_id, description, icon_id) in associations {
+        success &= set_registry_string(
+            &format!(r"{capabilities}\FileAssociations"),
+            Some(extension),
+            prog_id,
+        );
+        success &= set_registry_string(
+            r"Software\Classes\Applications\QuickPreview.exe\SupportedTypes",
+            Some(extension),
+            "",
+        );
+        let class = format!(r"Software\Classes\{prog_id}");
+        success &= set_registry_string(&class, None, description);
+        success &= set_registry_string(
+            &format!(r"{class}\DefaultIcon"),
+            None,
+            &format!("\"{executable}\",-{icon_id}"),
+        );
+        success &=
+            set_registry_string(&format!(r"{class}\shell\open\command"), None, &open_command);
+    }
+    if success {
+        unsafe {
+            SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
+        }
+    }
+    success
+}
+fn set_registry_string(key_path: &str, value_name: Option<&str>, value: &str) -> bool {
+    let key_path = wide(key_path);
+    let value_name = wide(value_name.unwrap_or_default());
+    let value = wide(value);
+    let bytes = unsafe {
+        std::slice::from_raw_parts(value.as_ptr().cast::<u8>(), value.len() * size_of::<u16>())
+    };
+    let mut key = HKEY(std::ptr::null_mut());
+    let created = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_path.as_ptr()),
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut key,
+            None,
+        )
+    };
+    if created != ERROR_SUCCESS {
+        return false;
+    }
+    let written =
+        unsafe { RegSetValueExW(key, PCWSTR(value_name.as_ptr()), None, REG_SZ, Some(bytes)) }
+            == ERROR_SUCCESS;
+    unsafe {
+        let _ = RegCloseKey(key);
+    }
+    written
 }
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
