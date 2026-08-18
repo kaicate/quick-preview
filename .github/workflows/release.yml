@@ -35,7 +35,7 @@ jobs:
         run: |
           $tag = "${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
           if ($tag -notmatch '^v(?<version>\d+\.\d+\.\d+)$') {
-            throw "Release tags must use vMAJOR.MINOR.PATCH (for example, v0.1.4)."
+            throw "Release tags must use vMAJOR.MINOR.PATCH (for example, v0.1.5)."
           }
           $tagVersion = $Matches.version
 
